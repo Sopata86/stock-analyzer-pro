@@ -165,7 +165,7 @@ with st.sidebar:
     st.caption("Примери: NVDA, ASML, MSFT, SIE.DE, RHM.DE, EYPT, PFE.")
     st.caption("Тикерът на Dronamics и други акции на БФБ може да не се поддържа от Yahoo Finance.")
 
-tab_scan, tab_detail, tab_short, tab_long, tab_method = st.tabs(["🔎 Скенер на акции", "📊 Подробен анализ", "🔴 Краткосрочен план", "🟢 Инвестиционен план", "ℹ️ Методика"])
+tab_scan, tab_detail, tab_short, tab_long, tab_backtest, tab_method = st.tabs(["🔎 Скенер на акции", "📊 Подробен анализ", "🔴 Краткосрочен план", "🟢 Инвестиционен план", "🧪 Исторически тест", "ℹ️ Методика"])
 
 with tab_scan:
     st.subheader("Скенер за потенциални кандидати")
@@ -258,12 +258,17 @@ with tab_detail:
                     hist = df["Close"].pct_change(n).dropna()
                     if len(hist) >= 20:
                         lo, med, hi = hist.quantile(.10), hist.quantile(.50), hist.quantile(.90)
+                        method = f"Исторически персентили от {len(hist)} наблюдения"
                     else:
-                        lo, med, hi = -1.28*vol*np.sqrt(n), 0, 1.28*vol*np.sqrt(n)
-                    rows.append({"Хоризонт":h,"Негативен исторически ориентир":f"{lo*100:+.1f}%",
-                                 "Медианен исторически ориентир":f"{med*100:+.1f}%",
-                                 "Положителен исторически ориентир":f"{hi*100:+.1f}%",
-                                 "Цена при медиана":fmt(price*(1+med),currency)})
+                        lo, med, hi = -1.28*vol*np.sqrt(n), 0.0, 1.28*vol*np.sqrt(n)
+                        method = "Приближение от дневната волатилност (малко наблюдения)"
+                    rows.append({"Хоризонт":h,"Метод":method,
+                                 "Негативен ориентир":f"{lo*100:+.1f}%",
+                                 "Цена при негативен сценарий":fmt(price*(1+lo),currency),
+                                 "Медианен ориентир":f"{med*100:+.1f}%",
+                                 "Цена при медиана":fmt(price*(1+med),currency),
+                                 "Положителен ориентир":f"{hi*100:+.1f}%",
+                                 "Цена при положителен сценарий":fmt(price*(1+hi),currency)})
                 st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
             else:
                 st.info("Недостатъчно данни за сценарии по хоризонти.")
@@ -400,13 +405,138 @@ with tab_long:
             st.info("Резултатът е смесен. Няма достатъчно съгласувани фактори за силен извод.")
         st.write("**Правило за диверсификация:** лимитът е таван, не цел за задължително инвестиране. Не е нужно да използваш целия капитал.")
 
+
+with tab_backtest:
+    st.subheader("🧪 Историческа проверка на стратегиите")
+    st.warning("Тест върху минали дневни данни, не прогноза. Не включва данъци, дивиденти и всички реални особености на изпълнение. Резултатите зависят от избрания период и параметри.")
+    bt_period_label = st.selectbox("Исторически период", ["2 години", "5 години", "10 години"], index=1, key="bt_period")
+    bt_period = {"2 години":"2y", "5 години":"5y", "10 години":"10y"}[bt_period_label]
+    fee_bps = st.number_input("Разходи за сделка (комисиона + приплъзване, базисни пункта на страна)", min_value=0, max_value=200, value=10, step=5, key="bt_cost")
+    hold_days = st.slider("Максимален период на краткосрочна сделка (сесии)", 5, 60, 20, 5, key="bt_hold")
+    rr = st.slider("Цел риск/печалба за краткосрочния тест", 1.0, 4.0, 2.0, 0.5, key="bt_rr")
+    bt_df, _ = load_data(ticker, bt_period) if ticker else (pd.DataFrame(), {})
+    if bt_df.empty or len(bt_df) < 220:
+        st.info("Нужни са поне около 220 дневни сесии. Избери ликвиден тикер и по-дълъг период.")
+    else:
+        d = bt_df.copy().dropna(subset=["Open","High","Low","Close","SMA50","SMA200","RSI14","MACD","MACD_signal","ATR14"])
+        cost = fee_bps / 10000.0
+
+        # Short-term: signal on close, entry at next session open; stop/target checked with daily high/low.
+        trades = []
+        i = 1
+        while i < len(d)-1:
+            row = d.iloc[i]
+            prev = d.iloc[i-1]
+            signal = (row["Close"] > row["SMA50"] and row["RSI14"] >= 50 and row["RSI14"] < 70
+                      and row["MACD"] > row["MACD_signal"] and
+                      not (prev["MACD"] > prev["MACD_signal"] and row["MACD"] <= row["MACD_signal"]))
+            if not signal:
+                i += 1
+                continue
+            entry_i = i+1
+            entry = float(d.iloc[entry_i]["Open"])
+            atr = float(row["ATR14"])
+            if not np.isfinite(entry) or entry <= 0 or not np.isfinite(atr) or atr <= 0:
+                i += 1
+                continue
+            stop = entry - 1.5*atr
+            target = entry + (entry-stop)*rr
+            exit_i = min(entry_i+hold_days, len(d)-1)
+            exit_price, reason, actual_exit_i = float(d.iloc[exit_i]["Close"]), "Времеви изход", exit_i
+            for j in range(entry_i, exit_i+1):
+                day = d.iloc[j]
+                hit_stop = float(day["Low"]) <= stop
+                hit_target = float(day["High"]) >= target
+                # Conservative assumption if both levels touched in one daily candle.
+                if hit_stop:
+                    exit_price, reason, actual_exit_i = stop, "Стоп", j
+                    break
+                if hit_target:
+                    exit_price, reason, actual_exit_i = target, "Цел", j
+                    break
+            net_ret = (exit_price/entry - 1) - 2*cost
+            trades.append({"Вход":d.index[entry_i], "Изход":d.index[actual_exit_i], "Доходност %":net_ret*100,
+                           "Причина":reason, "Дни":actual_exit_i-entry_i})
+            i = actual_exit_i + 1
+
+        # Long-term: golden-cross trend regime; enter next open and exit next open after bearish regime.
+        long_trades = []
+        in_pos = False
+        entry_price = None
+        entry_date = None
+        for i in range(1, len(d)-1):
+            row, prev = d.iloc[i], d.iloc[i-1]
+            bullish = row["Close"] > row["SMA200"] and row["SMA50"] > row["SMA200"]
+            bearish = row["Close"] < row["SMA200"] or row["SMA50"] < row["SMA200"]
+            if not in_pos and bullish and not (prev["Close"] > prev["SMA200"] and prev["SMA50"] > prev["SMA200"]):
+                entry_price = float(d.iloc[i+1]["Open"])
+                entry_date = d.index[i+1]
+                in_pos = True
+            elif in_pos and bearish:
+                exit_price = float(d.iloc[i+1]["Open"])
+                net_ret = (exit_price/entry_price - 1) - 2*cost
+                long_trades.append({"Вход":entry_date, "Изход":d.index[i+1], "Доходност %":net_ret*100})
+                in_pos = False
+        if in_pos:
+            exit_price = float(d.iloc[-1]["Close"])
+            net_ret = (exit_price/entry_price - 1) - 2*cost
+            long_trades.append({"Вход":entry_date, "Изход":d.index[-1], "Доходност %":net_ret*100})
+
+        def summarize_trades(trade_list):
+            if not trade_list:
+                return None
+            t = pd.DataFrame(trade_list)
+            wins = t[t["Доходност %"] > 0]["Доходност %"]
+            losses = t[t["Доходност %"] <= 0]["Доходност %"]
+            gross_profit = wins.sum()
+            gross_loss = abs(losses.sum())
+            return t, {
+                "Брой сделки":len(t),
+                "Успеваемост":f"{(t['Доходност %'] > 0).mean()*100:.1f}%",
+                "Средна доходност/сделка":f"{t['Доходност %'].mean():+.2f}%",
+                "Медианна доходност/сделка":f"{t['Доходност %'].median():+.2f}%",
+                "Profit factor":f"{gross_profit/gross_loss:.2f}" if gross_loss > 0 else ("∞" if gross_profit > 0 else "—"),
+                "Най-добра сделка":f"{t['Доходност %'].max():+.2f}%",
+                "Най-лоша сделка":f"{t['Доходност %'].min():+.2f}%"
+            }
+
+        st.markdown("### 🔴 Краткосрочна стратегия")
+        short_result = summarize_trades(trades)
+        if short_result:
+            short_table, short_stats = short_result
+            st.dataframe(pd.DataFrame([short_stats]), use_container_width=True, hide_index=True)
+            st.dataframe(short_table.sort_values("Вход", ascending=False), use_container_width=True, hide_index=True)
+        else:
+            st.info("Няма сделки според тези правила в избрания период. Това е резултат, не грешка.")
+
+        st.markdown("### 🟢 Дългосрочна стратегия")
+        long_result = summarize_trades(long_trades)
+        if long_result:
+            long_table, long_stats = long_result
+            st.dataframe(pd.DataFrame([long_stats]), use_container_width=True, hide_index=True)
+            st.dataframe(long_table.sort_values("Вход", ascending=False), use_container_width=True, hide_index=True)
+        else:
+            st.info("Няма завършени сделки за дългосрочната стратегия в този период.")
+
+        # Buy-and-hold benchmark over same data window.
+        bh = (float(d["Close"].iloc[-1])/float(d["Close"].iloc[0])-1)*100
+        st.metric("Сравнение: купи и задръж за целия период", f"{bh:+.2f}%")
+        st.caption("Методика: сигналите се изчисляват след затваряне; входът е на следващото отваряне. При дневна свещ, докоснала и стоп, и цел, се приема стопът първо (консервативно). Не е walk-forward оптимизация и не гарантира повторяемост.")
+        if short_result:
+            st.download_button("Изтегли краткосрочните сделки CSV", pd.DataFrame(trades).to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"{ticker}_short_backtest.csv", mime="text/csv")
+        if long_result:
+            st.download_button("Изтегли дългосрочните сделки CSV", pd.DataFrame(long_trades).to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"{ticker}_long_backtest.csv", mime="text/csv")
+
 with tab_method:
     st.markdown("""
     ### Как работи
     - **Скенер:** подрежда избраните компании по комбинация от техническа оценка, опростен фундаментален филтър и необичайно висок обем.
     - **Технически анализ:** цена спрямо SMA 50/200, RSI и MACD.
     - **Фундаментален филтър:** използва ръст на приходите/печалбата, марж, forward P/E и debt/equity, само когато данните са налични.
-    - **Сценарии:** исторически 10-и, 50-и и 90-и персентил на доходността за сходен период. Това описва минали движения, не гарантира бъдещи резултати.
+    - **Сценарии:** исторически 10-и, 50-и и 90-и персентил на доходността за сходен период; процентът и съответната цена се изчисляват от една и съща стойност.
+    - **Исторически тест:** отделно проверява краткосрочна ATR стратегия и дългосрочен тренд филтър. Това е опростен backtest, не доказателство за бъдеща успеваемост.
     - **Обем:** последният обем се сравнява със средния за 20 сесии; резки скокове може да са важни, но не казват сами по себе си посоката.
 
     ### Ограничения и риск
