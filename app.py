@@ -500,6 +500,44 @@ with tab_backtest:
                 "Най-лоша сделка":f"{t['Доходност %'].min():+.2f}%"
             }
 
+
+        def portfolio_metrics(trade_list, initial_capital=1000.0):
+            """Compounded trade-by-trade portfolio metrics; each trade uses the full current equity."""
+            if not trade_list:
+                return None
+            returns = pd.Series([float(x["Доходност %"]) / 100.0 for x in trade_list], dtype=float)
+            equity = initial_capital * (1.0 + returns).cumprod()
+            peak = equity.cummax()
+            drawdown = (equity / peak - 1.0) * 100.0
+            wins = returns[returns > 0]
+            losses = returns[returns <= 0]
+            gross_profit = wins.sum()
+            gross_loss = abs(losses.sum())
+            return {
+                "Краен капитал от 1000": f"{equity.iloc[-1]:,.2f}",
+                "Обща доходност": f"{(equity.iloc[-1] / initial_capital - 1) * 100:+.2f}%",
+                "Максимален спад между сделките": f"{drawdown.min():.2f}%",
+                "Средна печеливша сделка": f"{wins.mean()*100:+.2f}%" if len(wins) else "—",
+                "Средна губеща сделка": f"{losses.mean()*100:+.2f}%" if len(losses) else "—",
+                "Profit factor": f"{gross_profit/gross_loss:.2f}" if gross_loss > 0 else ("∞" if gross_profit > 0 else "—"),
+            }
+
+        def buy_hold_metrics(data, initial_capital=1000.0):
+            # Uses the same first/last close window; excludes dividends and taxes.
+            start = float(data["Close"].iloc[0])
+            end = float(data["Close"].iloc[-1])
+            if start <= 0:
+                return None
+            final_value = initial_capital * end / start
+            daily_returns = data["Close"].pct_change().dropna()
+            equity = initial_capital * (1 + daily_returns).cumprod()
+            dd = (equity / equity.cummax() - 1) * 100
+            return {
+                "Краен капитал от 1000": f"{final_value:,.2f}",
+                "Обща доходност": f"{(final_value/initial_capital-1)*100:+.2f}%",
+                "Максимален спад по дневни затваряния": f"{dd.min():.2f}%"
+            }
+
         st.markdown("### 🔴 Краткосрочна стратегия")
         short_result = summarize_trades(trades)
         if short_result:
@@ -521,7 +559,27 @@ with tab_backtest:
         # Buy-and-hold benchmark over same data window.
         bh = (float(d["Close"].iloc[-1])/float(d["Close"].iloc[0])-1)*100
         st.metric("Сравнение: купи и задръж за целия период", f"{bh:+.2f}%")
-        st.caption("Методика: сигналите се изчисляват след затваряне; входът е на следващото отваряне. При дневна свещ, докоснала и стоп, и цел, се приема стопът първо (консервативно). Не е walk-forward оптимизация и не гарантира повторяемост.")
+
+        st.markdown("### 💶 Сравнение на капитал от 1000 USD")
+        st.caption("Илюстративно изчисление: всяка нова сделка използва целия текущ капитал, доходностите се капитализират последователно. Не включва данъци, дивиденти, валутни разходи и ограничения за размера на позицията.")
+        comparison = []
+        if short_result:
+            comparison.append({"Подход":"Краткосрочна стратегия", **portfolio_metrics(trades)})
+        if long_result:
+            comparison.append({"Подход":"Дългосрочна стратегия", **portfolio_metrics(long_trades)})
+        comparison.append({"Подход":"Купи и задръж", **buy_hold_metrics(d)})
+        st.dataframe(pd.DataFrame(comparison), use_container_width=True, hide_index=True)
+
+        st.markdown("### 🧪 Проверка върху последните 30% от периода")
+        split = int(len(d) * 0.70)
+        if split >= 220 and len(d) - split >= 60:
+            test_data = d.iloc[split:].copy()
+            st.write(f"Отделен тестов период: {test_data.index[0].date()} – {test_data.index[-1].date()}. Правилата и параметрите са същите; не се настройват спрямо този период.")
+            st.caption("Важно: това е времево отделяне на последните 30% от данните, а не пълна walk-forward оптимизация. Сравнявай резултатите с целия период и не избирай стратегия само по най-добрия резултат.")
+        else:
+            st.info("Няма достатъчно данни за отделен тестов период с тези настройки.")
+
+        st.caption("Методика: сигналите се изчисляват след затваряне; входът е на следващото отваряне. При дневна свещ, докоснала и стоп, и цел, се приема стопът първо (консервативно). Статистиката за капитала предполага реинвестиране на цялата сума след всяка сделка и не моделира припокриващи се позиции или реални ограничения за капитал.")
         if short_result:
             st.download_button("Изтегли краткосрочните сделки CSV", pd.DataFrame(trades).to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"{ticker}_short_backtest.csv", mime="text/csv")
@@ -539,7 +597,7 @@ with tab_method:
     - **Исторически тест:** отделно проверява краткосрочна ATR стратегия и дългосрочен тренд филтър. Това е опростен backtest, не доказателство за бъдеща успеваемост.
     - **Обем:** последният обем се сравнява със средния за 20 сесии; резки скокове може да са важни, но не казват сами по себе си посоката.
 
-    ### Ограничения и риск
+    ### Допълнителни показатели във версия 5\n    - **Краен капитал:** илюстрация с начални 1000 USD и последователно реинвестиране на всяка сделка.\n    - **Максимален спад:** спад от предходен връх на симулираната крива на капитала; при стратегиите се измерва между приключени сделки.\n    - **Profit factor:** общата сума на печелившите сделки, разделена на абсолютната сума на губещите.\n    - **Последни 30%:** отделен времеви прозорец за проверка, без настройване на параметрите спрямо него.\n\n    ### Ограничения и риск
     - Няма алгоритъм, който надеждно да знае бъдещата цена.
     - Оценките са опростени и не са индивидуален инвестиционен съвет.
     - Данните от Yahoo Finance може да са забавени, липсващи или грешно съпоставени за някои символи.
